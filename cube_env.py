@@ -116,7 +116,7 @@ def get_neighbors(state):
 def state_to_onehot(state):
     onehot = np.zeros(ONE_HOT_DIM, dtype=np.float32)
     for i, color in enumerate(state):
-        onehot[i * NUM_COLORS + color] = 1.0
+        onehot[i * NUM_COLORS + int(color)] = 1.0
     return onehot
 
 
@@ -125,7 +125,7 @@ def batch_state_to_onehot(states):
     onehot = np.zeros((N, ONE_HOT_DIM), dtype=np.float32)
     positions = np.arange(NUM_STICKERS)
     for i in range(N):
-        onehot[i, positions * NUM_COLORS + states[i]] = 1.0
+        onehot[i, positions * NUM_COLORS + states[i].astype(int)] = 1.0
     return onehot
 
 
