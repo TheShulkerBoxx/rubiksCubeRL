@@ -179,3 +179,41 @@ if __name__ == "__main__":
         assert c2.is_solved(), f"4x {MOVE_NAMES[move_idx]} should be identity"
 
     print("All cube_env tests passed")
+
+
+# Pre-stack as (NUM_MOVES, 24) for vectorized batch operations
+MOVE_PERMS_ARRAY = np.stack(MOVE_PERMS)
+
+
+def batch_scramble(batch_size, max_depth):
+    """Generate a batch of scrambled states - vectorized."""
+    depths = np.random.randint(1, max_depth + 1, size=batch_size)
+    actual_max = int(depths.max())
+    states = np.tile(SOLVED_STATE, (batch_size, 1))
+    all_moves = np.random.randint(0, NUM_MOVES, size=(actual_max, batch_size))
+
+    for step in range(actual_max):
+        active = step < depths
+        if not active.any():
+            break
+        move_indices = all_moves[step]
+        for m in range(NUM_MOVES):
+            mask = active & (move_indices == m)
+            if mask.any():
+                states[mask] = states[mask][:, MOVE_PERMS[m]]
+
+    return states, depths
+
+
+def batch_get_all_neighbors(states):
+    """Get all neighbors for a batch of states."""
+    N = states.shape[0]
+    neighbors = np.empty((N, NUM_MOVES, 24), dtype=np.int8)
+    for m in range(NUM_MOVES):
+        neighbors[:, m, :] = states[:, MOVE_PERMS[m]]
+    return neighbors
+
+
+def batch_is_solved(states):
+    """Check which states in a batch are solved."""
+    return np.all(states == SOLVED_STATE, axis=1)
