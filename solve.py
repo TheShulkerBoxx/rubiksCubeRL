@@ -18,6 +18,14 @@ from cube_env import (
 from model import ValueNetwork
 
 
+def get_device():
+    if torch.backends.mps.is_available():
+        return torch.device("mps")
+    elif torch.cuda.is_available():
+        return torch.device("cuda")
+    return torch.device("cpu")
+
+
 def evaluate_states(states, network, device):
     if not states:
         return np.array([])
@@ -104,7 +112,7 @@ def main():
         np.random.seed(args.seed)
         torch.manual_seed(args.seed)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = get_device()
     print(f"Using device: {device}")
 
     network = ValueNetwork()

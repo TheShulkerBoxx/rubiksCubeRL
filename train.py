@@ -24,6 +24,14 @@ from cube_env import (
 from model import ValueNetwork
 
 
+def get_device():
+    if torch.backends.mps.is_available():
+        return torch.device("mps")
+    elif torch.cuda.is_available():
+        return torch.device("cuda")
+    return torch.device("cpu")
+
+
 def generate_training_data(batch_size, max_depth):
     states = np.zeros((batch_size, 24), dtype=np.int8)
     depths = np.zeros(batch_size, dtype=np.int32)
@@ -64,7 +72,7 @@ def compute_targets(states, network, device):
 
 
 def train(args):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = get_device()
     print(f"Training on: {device}")
 
     network = ValueNetwork().to(device)
