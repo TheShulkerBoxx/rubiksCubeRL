@@ -78,7 +78,7 @@ def train(args):
     network = ValueNetwork().to(device)
     optimizer = optim.Adam(network.parameters(), lr=args.lr, weight_decay=1e-6)
     scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=args.lr_step, gamma=0.1)
-    loss_fn = nn.MSELoss()
+    loss_fn = nn.HuberLoss(delta=1.0)
 
     os.makedirs(args.checkpoint_dir, exist_ok=True)
 
@@ -110,6 +110,7 @@ def train(args):
 
         optimizer.zero_grad()
         loss.backward()
+        torch.nn.utils.clip_grad_norm_(network.parameters(), max_norm=1.0)
         optimizer.step()
 
         running_loss += loss.item()
