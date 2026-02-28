@@ -1,13 +1,20 @@
 """
-Autodidactic Iteration (ADI) training loop for the 2x2 Rubik's Cube.
+Autodidactic Iteration (ADI) training for the 2x2 Rubik's Cube.
+Matches the official DeepCubeA training approach.
 
-Implements the core training algorithm from the DeepCubeA paper:
-  1. Generate scrambled states by working backwards from solved
-  2. For each state, compute target = 1 + min(value(neighbors))
-  3. Train the value network with MSE loss on these targets
+Key features (from the paper / official repo):
+  1. Target network — frozen copy for stable target generation
+  2. Batch-epoch training — generate large dataset, train multiple epochs
+  3. Target network updated only when loss drops below threshold
+  4. Exponential LR decay per iteration
+  5. Raw integer states sent to GPU, one-hot done in-network
+
+Usage:
+    python train.py --num_updates 100 --states_per_update 50000
 """
 
 import argparse
+import copy
 import os
 import time
 
@@ -17,14 +24,18 @@ import torch.nn as nn
 import torch.optim as optim
 
 from cube_env import (
-    SOLVED_STATE, NUM_MOVES, ONE_HOT_DIM,
-    apply_move, is_solved, scramble,
-    batch_state_to_onehot, state_to_onehot,
+    SOLVED_STATE,
+    NUM_MOVES,
+    MOVE_PERMS,
+    batch_scramble,
+    batch_get_all_neighbors,
+    batch_is_solved,
 )
-from model import ValueNetwork
+from model import ResnetModel
 
 
-def get_device():
+def get_device() -> torch.device:
+    """Select best available device: MPS (Apple Silicon) > CUDA > CPU."""
     if torch.backends.mps.is_available():
         return torch.device("mps")
     elif torch.cuda.is_available():
@@ -32,129 +43,228 @@ def get_device():
     return torch.device("cpu")
 
 
-def generate_training_data(batch_size, max_depth):
-    states = np.zeros((batch_size, 24), dtype=np.int8)
-    depths = np.zeros(batch_size, dtype=np.int32)
-    for i in range(batch_size):
-        depth = np.random.randint(1, max_depth + 1)
-        s, _ = scramble(depth)
-        states[i] = s
-        depths[i] = depth
-    return states, depths
+def generate_targets(
+    states: np.ndarray,
+    target_net: ResnetModel,
+    device: torch.device,
+    all_zeros: bool = False,
+) -> np.ndarray:
+    """
+    Compute ADI targets for a batch of states using the TARGET network.
 
+    target(s) = 0                           if s is solved
+    target(s) = 1 + min_a V_target(s')      otherwise
 
-def compute_targets(states, network, device):
+    When all_zeros=True (first update, untrained target), targets are set
+    to 0 for solved states and 1 for all others.
+    """
     N = states.shape[0]
-    targets = np.zeros(N, dtype=np.float32)
 
-    all_neighbors = np.zeros((N, NUM_MOVES, 24), dtype=np.int8)
-    for m in range(NUM_MOVES):
-        for i in range(N):
-            all_neighbors[i, m] = apply_move(states[i], m)
+    if all_zeros:
+        solved_mask = batch_is_solved(states)
+        return np.where(solved_mask, 0.0, 1.0).astype(np.float32)
 
+    # Get all neighbors: (N, NUM_MOVES, 24)
+    all_neighbors = batch_get_all_neighbors(states)
     flat_neighbors = all_neighbors.reshape(N * NUM_MOVES, 24)
-    flat_onehot = batch_state_to_onehot(flat_neighbors)
-    flat_tensor = torch.from_numpy(flat_onehot).to(device)
 
+    # Batch evaluate on GPU using target network
+    flat_tensor = torch.from_numpy(flat_neighbors).to(device)
+
+    chunk_size = 10000
+    flat_values = []
     with torch.no_grad():
-        flat_values = network(flat_tensor).cpu().numpy().squeeze(-1)
+        for i in range(0, flat_tensor.shape[0], chunk_size):
+            chunk = flat_tensor[i : i + chunk_size]
+            vals = target_net(chunk)
+            flat_values.append(vals.cpu())
+    flat_values = torch.cat(flat_values).numpy().squeeze(-1)
+
+    # Clip values to >= 0 (matching official code: clip_zero=True)
+    flat_values = np.maximum(flat_values, 0.0)
 
     neighbor_values = flat_values.reshape(N, NUM_MOVES)
     min_neighbor = neighbor_values.min(axis=1)
 
-    for i in range(N):
-        if is_solved(states[i]):
-            targets[i] = 0.0
-        else:
-            targets[i] = 1.0 + min_neighbor[i]
+    solved_mask = batch_is_solved(states)
+    targets = np.where(solved_mask, 0.0, 1.0 + min_neighbor).astype(np.float32)
 
     return targets
 
 
+def train_on_dataset(
+    nnet: ResnetModel,
+    states: np.ndarray,
+    targets: np.ndarray,
+    device: torch.device,
+    batch_size: int,
+    num_epochs: int,
+    lr: float,
+    lr_d: float,
+    train_itr: int,
+) -> tuple[float, int]:
+    """
+    Train the network on a fixed dataset for num_epochs epochs.
+    Returns (last_loss, updated_train_itr).
+    """
+    N = states.shape[0]
+    optimizer = optim.Adam(nnet.parameters(), lr=lr)
+    criterion = nn.MSELoss()
+
+    nnet.train()
+    last_loss = float("inf")
+
+    for epoch in range(num_epochs):
+        # Shuffle dataset each epoch
+        perm = np.random.permutation(N)
+        states_shuffled = states[perm]
+        targets_shuffled = targets[perm]
+
+        epoch_loss = 0.0
+        num_batches = 0
+
+        for start in range(0, N, batch_size):
+            end = min(start + batch_size, N)
+            if end - start < 2:  # skip tiny batches (BatchNorm needs ≥2)
+                continue
+
+            # Exponential LR decay per iteration
+            lr_itr = lr * (lr_d ** train_itr)
+            for param_group in optimizer.param_groups:
+                param_group["lr"] = lr_itr
+
+            # Send raw int states to GPU (one-hot inside network)
+            x = torch.from_numpy(states_shuffled[start:end]).to(device)
+            y = torch.from_numpy(targets_shuffled[start:end]).unsqueeze(1).to(device)
+
+            pred = nnet(x)
+            loss = criterion(pred.squeeze(-1), y.squeeze(-1))
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            last_loss = loss.item()
+            epoch_loss += last_loss
+            num_batches += 1
+            train_itr += 1
+
+        if num_batches > 0:
+            avg_loss = epoch_loss / num_batches
+
+    return last_loss, train_itr
+
+
 def train(args):
+    """Main training loop with target network pattern."""
     device = get_device()
     print(f"Training on: {device}")
+    print(f"Target network updates when loss < {args.loss_thresh}")
 
-    network = ValueNetwork().to(device)
-    optimizer = optim.Adam(network.parameters(), lr=args.lr, weight_decay=1e-6)
-    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=args.lr_step, gamma=0.1)
-    loss_fn = nn.HuberLoss(delta=1.0)
+    # Initialize current and target networks
+    nnet = ResnetModel().to(device)
+    target_net = copy.deepcopy(nnet)
+    target_net.eval()
 
+    total_params = sum(p.numel() for p in nnet.parameters())
+    print(f"Model parameters: {total_params:,}")
+
+    # Checkpointing
     os.makedirs(args.checkpoint_dir, exist_ok=True)
 
-    start_iter = 0
-    if args.resume and os.path.exists(os.path.join(args.checkpoint_dir, "latest.pt")):
-        ckpt = torch.load(os.path.join(args.checkpoint_dir, "latest.pt"), weights_only=False)
-        network.load_state_dict(ckpt["model_state_dict"])
-        optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-        start_iter = ckpt["iteration"]
-        print(f"Resumed from iteration {start_iter}")
+    # Resume from checkpoint
+    update_num = 0
+    train_itr = 0
+    all_zeros = True  # First update: target is untrained
 
-    log_interval = max(1, args.num_iterations // 100)
-    running_loss = 0.0
+    ckpt_path = os.path.join(args.checkpoint_dir, "latest.pt")
+    if args.resume and os.path.exists(ckpt_path):
+        ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+        nnet.load_state_dict(ckpt["model_state_dict"])
+        target_net.load_state_dict(ckpt["target_state_dict"])
+        update_num = ckpt.get("update_num", 0)
+        train_itr = ckpt.get("train_itr", 0)
+        all_zeros = False
+        print(f"Resumed: update_num={update_num}, train_itr={train_itr}")
+
     start_time = time.time()
 
-    for iteration in range(start_iter, args.num_iterations):
-        states, depths = generate_training_data(args.batch_size, args.max_scramble_depth)
+    for update in range(update_num, args.num_updates):
+        update_start = time.time()
 
-        network.eval()
-        targets = compute_targets(states, network, device)
+        # ── 1. Generate training data using TARGET network ────────────
+        print(f"\n[Update {update + 1}/{args.num_updates}]")
+        print(f"  Generating {args.states_per_update:,} states (depth 1–{args.back_max})...")
 
-        network.train()
-        onehot = batch_state_to_onehot(states)
-        x = torch.from_numpy(onehot).to(device)
-        y = torch.from_numpy(targets).unsqueeze(1).to(device)
+        states, depths = batch_scramble(args.states_per_update, args.back_max)
 
-        pred = network(x)
-        loss = loss_fn(pred, y)
+        target_net.eval()
+        targets = generate_targets(states, target_net, device, all_zeros=all_zeros)
 
-        optimizer.zero_grad()
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(network.parameters(), max_norm=1.0)
-        optimizer.step()
+        print(f"  Targets: mean={targets.mean():.2f}, min={targets.min():.2f}, max={targets.max():.2f}")
 
-        running_loss += loss.item()
+        # ── 2. Train current network on this fixed dataset ────────────
+        num_train_itrs = args.epochs_per_update * int(np.ceil(len(targets) / args.batch_size))
+        print(f"  Training for {args.epochs_per_update} epoch(s) ({num_train_itrs} iterations)...")
 
-        if (iteration + 1) % log_interval == 0:
-            avg_loss = running_loss / log_interval
-            elapsed = time.time() - start_time
-            iters_per_sec = (iteration + 1 - start_iter) / elapsed
-            print(
-                f"[Iter {iteration + 1:>7d}/{args.num_iterations}] "
-                f"loss={avg_loss:.4f}  lr={optimizer.param_groups[0]['lr']:.1e}  "
-                f"speed={iters_per_sec:.1f} it/s"
-            )
-            running_loss = 0.0
+        last_loss, train_itr = train_on_dataset(
+            nnet, states, targets, device,
+            batch_size=args.batch_size,
+            num_epochs=args.epochs_per_update,
+            lr=args.lr, lr_d=args.lr_d,
+            train_itr=train_itr,
+        )
 
-        if (iteration + 1) % args.checkpoint_interval == 0:
-            ckpt_path = os.path.join(args.checkpoint_dir, "latest.pt")
-            torch.save({
-                "iteration": iteration + 1,
-                "model_state_dict": network.state_dict(),
-                "optimizer_state_dict": optimizer.state_dict(),
-            }, ckpt_path)
+        elapsed = time.time() - update_start
+        total_elapsed = time.time() - start_time
+        print(f"  Loss: {last_loss:.4f} | LR: {args.lr * (args.lr_d ** train_itr):.2e} | "
+              f"Update time: {elapsed:.1f}s | Total: {total_elapsed:.0f}s")
 
-        scheduler.step()
+        # ── 3. Conditionally update target network ───────────────────
+        if last_loss < args.loss_thresh:
+            print(f"  ✓ Loss {last_loss:.4f} < threshold {args.loss_thresh} → updating target network")
+            target_net = copy.deepcopy(nnet)
+            target_net.eval()
+            all_zeros = False
+            update_num = update + 1
 
-    final_path = os.path.join(args.checkpoint_dir, "latest.pt")
-    torch.save({
-        "iteration": args.num_iterations,
-        "model_state_dict": network.state_dict(),
-        "optimizer_state_dict": optimizer.state_dict(),
-    }, final_path)
-    print(f"\nTraining complete. Saved to {final_path}")
+        # ── 4. Save checkpoint ────────────────────────────────────────
+        torch.save(
+            {
+                "model_state_dict": nnet.state_dict(),
+                "target_state_dict": target_net.state_dict(),
+                "update_num": update + 1,
+                "train_itr": train_itr,
+            },
+            ckpt_path,
+        )
+        print(f"  → Checkpoint saved")
+
+    print(f"\nTraining complete after {args.num_updates} updates, {train_itr} training iterations.")
 
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--num_iterations", type=int, default=100000)
-    parser.add_argument("--batch_size", type=int, default=1000)
-    parser.add_argument("--max_scramble_depth", type=int, default=30)
-    parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--lr_step", type=int, default=50000)
-    parser.add_argument("--checkpoint_dir", type=str, default="checkpoints")
-    parser.add_argument("--checkpoint_interval", type=int, default=1000)
-    parser.add_argument("--resume", action="store_true")
+    parser = argparse.ArgumentParser(description="ADI Training for 2x2 Rubik's Cube (DeepCubeA)")
+    parser.add_argument("--num_updates", type=int, default=200,
+                        help="Number of target network update cycles")
+    parser.add_argument("--states_per_update", type=int, default=50_000,
+                        help="States to generate per update cycle")
+    parser.add_argument("--batch_size", type=int, default=1_000,
+                        help="Training batch size")
+    parser.add_argument("--epochs_per_update", type=int, default=1,
+                        help="Training epochs per update cycle")
+    parser.add_argument("--back_max", type=int, default=30,
+                        help="Maximum scramble depth")
+    parser.add_argument("--lr", type=float, default=1e-3,
+                        help="Initial learning rate")
+    parser.add_argument("--lr_d", type=float, default=0.9999993,
+                        help="LR decay per iteration: lr * (lr_d ^ itr)")
+    parser.add_argument("--loss_thresh", type=float, default=0.1,
+                        help="Update target network when loss falls below this")
+    parser.add_argument("--checkpoint_dir", type=str, default="checkpoints",
+                        help="Directory to save checkpoints")
+    parser.add_argument("--resume", action="store_true",
+                        help="Resume from latest checkpoint")
     args = parser.parse_args()
     train(args)
 
