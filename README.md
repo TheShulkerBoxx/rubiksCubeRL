@@ -16,7 +16,7 @@ To keep things stable, there's a frozen "target network" that generates the targ
 
 **Solving:**
 
-Once trained, the value network is used as a heuristic for weighted A* search. Works pretty well for scrambles up to depth ~10-12 with moderate training.
+Once trained, the value network is used as a heuristic for weighted A* search.
 
 ## Architecture
 
@@ -28,13 +28,30 @@ input (24 sticker values) -> one-hot (144d) -> FC 2048 -> FC 512 -> 4 res blocks
 
 ~3.5M parameters.
 
+## Results
+
+After training for ~7 minutes on an M4 MacBook Pro (200 update cycles, 50K states each):
+
+![benchmark](results/benchmark.png)
+
+**100% solve rate at all depths 1-14** (God's number). 1400 total solves, zero failures.
+
+| Depth | Solve Rate | Avg Moves | Avg Nodes | Avg Time |
+|-------|-----------|-----------|-----------|----------|
+| 1     | 100%      | 1.0       | 1         | <1ms     |
+| 7     | 100%      | 4.8       | 5         | 7ms      |
+| 10    | 100%      | 6.7       | 8         | 12ms     |
+| 14    | 100%      | 8.6       | 66        | 114ms    |
+
+The solver is near-optimal -- most solutions are close to the shortest possible. Search is efficient too, usually expanding fewer than 100 nodes even at max depth.
+
 ## Usage
 
 ```
 pip install -r requirements.txt
 
-# train (takes a few minutes for basic results, longer for better ones)
-python train.py --num_updates 200 --states_per_update 50000 --back_max 30
+# train (~7 min on Apple Silicon)
+python train.py --num_updates 200 --states_per_update 50000 --epochs_per_update 3 --back_max 30
 
 # resume if you stopped it
 python train.py --resume
@@ -42,8 +59,8 @@ python train.py --resume
 # solve some scrambles
 python solve.py --model_path checkpoints/latest.pt --scramble_depth 10
 
-# harder scrambles, bigger search
-python solve.py --model_path checkpoints/latest.pt --scramble_depth 14 --max_nodes 50000
+# run the full benchmark
+python benchmark.py --model_path checkpoints/latest.pt
 ```
 
 ## Files
@@ -52,6 +69,7 @@ python solve.py --model_path checkpoints/latest.pt --scramble_depth 14 --max_nod
 - `model.py` - ResNet value network
 - `train.py` - training loop with target network
 - `solve.py` - A* solver
+- `benchmark.py` - performance benchmark + graph generation
 
 ## References
 
