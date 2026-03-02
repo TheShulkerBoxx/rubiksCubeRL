@@ -1,137 +1,62 @@
-# DeepCubeA: Solving the 2×2 Rubik's Cube with Deep Reinforcement Learning
+# DeepCubeA 2x2 Solver
 
-A deep reinforcement learning solver for the 2×2 Pocket Cube, implementing the Autodidactic Iteration algorithm from the [DeepCubeA paper](https://www.nature.com/articles/s42256-019-0070-z) (Agostinelli et al., 2019).
+Solving the 2x2 Rubik's cube with deep RL, based on the DeepCubeA paper (Agostinelli et al., 2019).
 
-A ResNet value network learns a cost-to-go function entirely from self-play — working backwards from the solved state using a target network for stable bootstrapping — then guides A\* search to find solutions.
+Trains a neural network to estimate how many moves any state is from solved, then uses that as a heuristic for A* search.
 
-## The 2×2 Rubik's Cube as a Group
+## How it works
 
-The 2×2 Pocket Cube is a mathematically elegant object.  Its set of reachable configurations forms a [group](https://en.wikipedia.org/wiki/Group_(mathematics)) under composition of moves:
+The 2x2 cube has about 3.67 million reachable states and God's number is 14 (quarter turn metric).
 
-| Property | Value |
-|---|---|
-| Reachable states | **3,674,160** |
-| Group structure | $(\\mathbb{Z}_3^7) \\rtimes S_7$ (orientations ⋊ permutations) |
-| God's number (QTM) | **14** (every state solvable in ≤14 quarter turns) |
-| God's number (HTM) | **11** |
+**Training (Autodidactic Iteration):**
 
-**Solving the cube means finding a path through this group back to the identity element** (the solved state).  Each face turn is a group element, and a solution is a word in the generators $\\{R, R', U, U', F, F'\\}$ that maps the scrambled state to the identity.
+The idea is to train backwards from the solved state. You scramble a bunch of cubes, then for each scrambled state, look at all its neighbors (states reachable in one move) and ask the network "how far are these from solved?". The target is `1 + min(neighbor values)`. Solved states get target 0.
 
-## Approach: DeepCubeA & Autodidactic Iteration
+To keep things stable, there's a frozen "target network" that generates the targets. The actual network being trained is separate. You only copy the trained weights into the target network once the loss drops below a threshold. This prevents the feedback loop where bad predictions make bad targets which make worse predictions (which absolutely does happen without it -- ask me how I know).
 
-### The Problem
+**Solving:**
 
-Classical RL struggles with the Rubik's Cube because:
-- **Sparse reward**: only one state out of millions is "solved"
-- **No natural curriculum**: random exploration almost never reaches the goal
-- **Huge state space**: even the 2×2 has 3.67M states
+Once trained, the value network is used as a heuristic for weighted A* search. Works pretty well for scrambles up to depth ~10-12 with moderate training.
 
-### Autodidactic Iteration (ADI)
+## Architecture
 
-The key insight is to **train in reverse** — start from the solved state, scramble, and learn to undo the scramble:
+ResNet with residual blocks, based on the architecture from the actual DeepCubeA repo:
 
 ```
-for each update cycle:
-    1. Generate N scrambled states from the SOLVED state
-    2. Use the FROZEN TARGET NETWORK to compute targets:
-         For each neighbor s' of s:  compute V_target(s')
-         Target: y(s) = 1 + min_a V_target(apply(s, a))
-         (solved state gets target 0)
-    3. Train the CURRENT network on this fixed dataset with MSE loss
-    4. If loss < threshold: copy current → target network
+input (24 sticker values) -> one-hot (144d) -> FC 2048 -> FC 512 -> 4 res blocks -> output (1 value)
 ```
 
-The **target network** is the key to stability: targets don't shift during training within an update cycle, preventing the bootstrapping divergence that naive ADI suffers from.
+~3.5M parameters.
 
-The value function $V(s)$ learns to estimate the **cost-to-go**: the minimum number of moves needed to solve state $s$.
-
-### Network Architecture (matches the paper)
+## Usage
 
 ```
-Input (24 ints) → F.one_hot → FC(144→2048) → BN → ReLU
-    → FC(2048→512) → BN → ReLU
-    → [ResBlock(512→512)]×4       # FC→BN→ReLU→FC→BN + skip → ReLU
-    → FC(512→1)                   # cost-to-go estimate
-```
-
-### Guided Search
-
-Once trained, the value network serves as a heuristic for **weighted A\* search**:
-
-$$f(s) = g(s) + \\lambda \\cdot h(s)$$
-
-where $g(s)$ is the path cost so far, $h(s) = V(s)$ is the neural network estimate, and $\\lambda$ is a weight that trades optimality for speed.
-
-## Project Structure
-
-```
-rubiksCubeRL/
-├── cube_env.py       # 2×2 cube environment (vectorized, batch operations)
-├── model.py          # ResNet value network (matches DeepCubeA architecture)
-├── train.py          # ADI training with target network + batch-epoch pattern
-├── solve.py          # Weighted A* search using the trained network
-├── requirements.txt  # Python dependencies
-├── LICENSE           # GPLv3
-└── README.md
-```
-
-## How to Run
-
-### Install
-
-```bash
 pip install -r requirements.txt
-```
 
-### Train
-
-```bash
-# Quick test (~2 minutes)
-python train.py --num_updates 10 --states_per_update 10000 --back_max 15
-
-# Full training (may take 30min–2hr depending on hardware)
+# train (takes a few minutes for basic results, longer for better ones)
 python train.py --num_updates 200 --states_per_update 50000 --back_max 30
 
-# Resume training
+# resume if you stopped it
 python train.py --resume
-```
 
-Checkpoints are saved to `checkpoints/latest.pt`.
+# solve some scrambles
+python solve.py --model_path checkpoints/latest.pt --scramble_depth 10
 
-### Solve
-
-```bash
-# Solve 10 random scrambles of depth 7
-python solve.py --model_path checkpoints/latest.pt --scramble_depth 7
-
-# Harder scrambles, larger search budget
+# harder scrambles, bigger search
 python solve.py --model_path checkpoints/latest.pt --scramble_depth 14 --max_nodes 50000
-
-# Weighted A* for faster (but possibly suboptimal) solutions
-python solve.py --model_path checkpoints/latest.pt --scramble_depth 14 --weight 5.0
 ```
 
-## Results
+## Files
 
-After training for 10k–50k iterations:
-- **Near-100% solve rate** on scrambles up to depth ~10
-- **Solution quality improves** with more training iterations and higher search budgets
-- **Shallow scrambles** (depth 1–5) are solved almost instantly
-
-*(Exact results depend on training duration and hardware.)*
-
-## Future Work
-
-- **3×3 Rubik's Cube**: The full cube has **43,252,003,274,489,856,000** (43 quintillion) reachable states.  The same ADI approach applies but requires significantly more compute and a larger network.  The original DeepCubeA paper trained on ~8 billion states over 44 hours.
-- **Policy head**: Add a policy output to the network for more directed search
-- **Batch-weighted A\* (BWAS)**: Expand multiple nodes per iteration for GPU-efficient search
-- **Curriculum learning**: Gradually increase scramble depth during training
-- **Symmetry exploitation**: Use the cube's symmetry group to reduce the effective state space
+- `cube_env.py` - 2x2 cube environment, moves, state representation
+- `model.py` - ResNet value network
+- `train.py` - training loop with target network
+- `solve.py` - A* solver
 
 ## References
 
-1. Agostinelli, F., McAleer, S., Shmakov, A., & Baldi, P. (2019). **Solving the Rubik's Cube with Deep Reinforcement Learning and Search.** *Nature Machine Intelligence, 1*, 356–363. [doi:10.1038/s42256-019-0070-z](https://doi.org/10.1038/s42256-019-0070-z)
+Agostinelli et al., "Solving the Rubik's Cube with Deep Reinforcement Learning and Search", Nature Machine Intelligence, 2019.
 
 ## License
 
-This project is licensed under the GNU General Public License v3.0 — see [LICENSE](LICENSE) for details.
+GPLv3
